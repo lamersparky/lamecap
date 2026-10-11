@@ -14,7 +14,13 @@
 #define SCREENCAST_IFACE "org.freedesktop.portal.ScreenCast"
 #define REQUEST_IFACE    "org.freedesktop.portal.Request"
 #define SESSION_IFACE    "org.freedesktop.portal.Session"
-#define APP_VERSION      "0.1.0"
+#define APP_VERSION      "0.2.0"
+
+typedef enum {
+    CAPTURE_BACKEND_AUTO,
+    CAPTURE_BACKEND_X11,
+    CAPTURE_BACKEND_PORTAL
+} CaptureBackend;
 
 typedef struct {
     GMainLoop *loop;
@@ -213,6 +219,46 @@ static gboolean element_factory_exists(const gchar *name)
     return TRUE;
 }
 
+static gboolean choose_backend(const gchar *requested,
+                               CaptureBackend *selected,
+                               GError **error)
+{
+    const gchar *session_type = g_getenv("XDG_SESSION_TYPE");
+    const gchar *wayland_display = g_getenv("WAYLAND_DISPLAY");
+    const gchar *x_display = g_getenv("DISPLAY");
+
+    if (g_strcmp0(requested, "auto") == 0) {
+        if (g_strcmp0(session_type, "x11") == 0) {
+            *selected = CAPTURE_BACKEND_X11;
+        } else if (g_strcmp0(session_type, "wayland") == 0 ||
+                   (wayland_display && *wayland_display)) {
+            *selected = CAPTURE_BACKEND_PORTAL;
+        } else if (x_display && *x_display) {
+            *selected = CAPTURE_BACKEND_X11;
+        } else {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                "Could not detect X11 or Wayland. Set DISPLAY/WAYLAND_DISPLAY or pass --backend explicitly.");
+            return FALSE;
+        }
+    } else if (g_strcmp0(requested, "x11") == 0) {
+        *selected = CAPTURE_BACKEND_X11;
+    } else if (g_strcmp0(requested, "portal") == 0) {
+        *selected = CAPTURE_BACKEND_PORTAL;
+    } else {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                    "Unknown backend '%s' (use auto, x11, or portal)",
+                    requested ? requested : "(null)");
+        return FALSE;
+    }
+
+    if (*selected == CAPTURE_BACKEND_X11 && (!x_display || !*x_display)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+            "The X11 backend requires DISPLAY to be set. Use --backend portal on Wayland.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static GstElement *make_first_available(const gchar **names,
                                         const gchar *instance_name,
                                         const gchar **chosen_name)
@@ -253,7 +299,8 @@ static void configure_video_encoder(GstElement *encoder,
     }
 }
 
-static GstElement *build_pipeline(gint pipewire_fd,
+static GstElement *build_pipeline(CaptureBackend backend,
+                                  gint pipewire_fd,
                                   const gchar *target_object,
                                   const gchar *output_path,
                                   const gchar *audio_monitor,
@@ -264,9 +311,11 @@ static GstElement *build_pipeline(gint pipewire_fd,
     static const gchar *audio_encoders[] = { "avenc_aac", "voaacenc", NULL };
     const gchar *video_encoder_name = NULL;
     const gchar *audio_encoder_name = NULL;
+    const gchar *source_factory = backend == CAPTURE_BACKEND_X11
+        ? "ximagesrc" : "pipewiresrc";
 
     GstElement *pipeline = gst_pipeline_new("lamecap-recording");
-    GstElement *src = gst_element_factory_make("pipewiresrc", "screen-source");
+    GstElement *src = gst_element_factory_make(source_factory, "screen-source");
     GstElement *vqueue = gst_element_factory_make("queue", "video-queue");
     GstElement *convert = gst_element_factory_make("videoconvert", "video-convert");
     GstElement *rate = gst_element_factory_make("videorate", "video-rate");
@@ -280,15 +329,27 @@ static GstElement *build_pipeline(gint pipewire_fd,
 
     if (!pipeline || !src || !vqueue || !convert || !rate || !capsfilter || !encoder ||
         !parser || !encoded_queue || !mux || !sink) {
-        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-            "Missing a required GStreamer element. Install the PipeWire, base, good, bad, ugly and libav GStreamer plugin packages.");
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+            "Missing a required GStreamer element for the %s backend or MP4 encoding. "
+            "Check that the GStreamer X11/PipeWire, base, good, bad, ugly and libav plugins are installed.",
+            backend == CAPTURE_BACKEND_X11 ? "X11" : "portal/PipeWire");
         goto fail;
     }
 
-    gchar *serial = g_strdup(target_object);
-    g_object_set(src, "fd", pipewire_fd, "target-object", serial,
-                 "do-timestamp", TRUE, NULL);
-    g_free(serial);
+    if (backend == CAPTURE_BACKEND_X11) {
+        /* ximagesrc captures the full X11 root window (the virtual desktop). */
+        set_optional_boolean(G_OBJECT(src), "use-damage", FALSE);
+        set_optional_boolean(G_OBJECT(src), "do-timestamp", TRUE);
+    } else {
+        if (pipewire_fd < 0 || !target_object || !*target_object) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                "The portal backend requires a PipeWire file descriptor and target object.");
+            goto fail;
+        }
+        g_object_set(src, "fd", pipewire_fd, "target-object", target_object,
+                     "do-timestamp", TRUE, NULL);
+    }
+
     g_object_set(sink, "location", output_path, "sync", FALSE, NULL);
     GstCaps *caps = gst_caps_from_string("video/x-raw,format=I420,framerate=30/1");
     g_object_set(capsfilter, "caps", caps, NULL);
@@ -344,8 +405,10 @@ static GstElement *build_pipeline(gint pipewire_fd,
         }
     }
 
+    g_print("lamecap: capture backend: %s\n",
+            backend == CAPTURE_BACKEND_X11 ? "X11 direct capture" : "desktop portal / PipeWire");
     g_print("lamecap: video encoder: %s\n", video_encoder_name);
-    if (audio_monitor)
+    if (audio_monitor && *audio_monitor)
         g_print("lamecap: audio monitor: %s (AAC: %s)\n", audio_monitor,
                 audio_encoder_name ? audio_encoder_name : "unknown");
     return pipeline;
@@ -354,7 +417,7 @@ fail_pipeline:
     gst_object_unref(pipeline);
     return NULL;
 fail:
-    /* This label is reached before elements have been added to the pipeline. */
+    /* Elements have not been added to the pipeline yet. */
     if (pipeline) gst_object_unref(pipeline);
     if (src) gst_object_unref(src);
     if (vqueue) gst_object_unref(vqueue);
@@ -419,16 +482,18 @@ static gboolean stop_recording(gpointer user_data)
 static void usage(FILE *stream)
 {
     fprintf(stream,
-        "lamecap %s - command-line GNOME/Wayland screen recorder\n\n"
+        "lamecap %s - command-line screen recorder\n\n"
         "Usage: lamecap [options]\n\n"
         "Options:\n"
         "  -o, --output FILE       Output MP4 path (default: timestamped file)\n"
-        "      --source MODE       monitor, window, or either (default: either)\n"
+        "      --backend MODE      auto, x11, or portal (default: auto)\n"
+        "      --source MODE       Portal source: monitor, window, or either\n"
         "      --audio-monitor ID  Capture a PulseAudio/PipeWire monitor source\n"
         "      --help              Show this help\n"
         "      --version           Show version\n\n"
-        "Start the browser video first, run lamecap, then choose the screen/window\n"
-        "in the desktop permission dialog. Press Ctrl+C once to finalize the MP4.\n",
+        "On X11, auto mode captures the full desktop directly, without a portal dialog.\n"
+        "On Wayland, auto mode uses the desktop ScreenCast portal and PipeWire.\n"
+        "Press Ctrl+C once to stop and finalize the MP4. Audio is opt-in.\n",
         APP_VERSION);
 }
 
@@ -437,12 +502,17 @@ int main(int argc, char **argv)
     const gchar *output_arg = NULL;
     const gchar *audio_monitor = NULL;
     const gchar *source_mode = "either";
+    const gchar *backend_arg = "auto";
+    const gchar *target_object = NULL;
     gchar *default_output = NULL;
     gchar *session_path = NULL;
     GDBusConnection *connection = NULL;
     gint pipewire_fd = -1;
     GstElement *pipeline = NULL;
     gint exit_status = 1;
+    GError *error = NULL;
+    CaptureBackend backend = CAPTURE_BACKEND_AUTO;
+    gchar serial_text[32] = {0};
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc)
@@ -451,6 +521,8 @@ int main(int argc, char **argv)
             audio_monitor = argv[++i];
         else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc)
             source_mode = argv[++i];
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc)
+            backend_arg = argv[++i];
         else if (strcmp(argv[i], "--help") == 0) { usage(stdout); return 0; }
         else if (strcmp(argv[i], "--version") == 0) { puts("lamecap " APP_VERSION); return 0; }
         else {
@@ -460,7 +532,7 @@ int main(int argc, char **argv)
         }
     }
 
-    guint source_types = 3; /* MONITOR | WINDOW */
+    guint source_types = 3; /* portal: MONITOR | WINDOW */
     if (strcmp(source_mode, "monitor") == 0) source_types = 1;
     else if (strcmp(source_mode, "window") == 0) source_types = 2;
     else if (strcmp(source_mode, "either") != 0) {
@@ -482,84 +554,102 @@ int main(int argc, char **argv)
     }
 
     gst_init(NULL, NULL);
-    if (!element_factory_exists("pipewiresrc")) {
-        g_printerr("lamecap: GStreamer element 'pipewiresrc' is missing. Install the GStreamer PipeWire plugin.\n");
-        goto cleanup;
-    }
-
-    GError *error = NULL;
-    connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
-    if (!connection) {
-        print_error("connecting to the desktop session bus", error);
+    if (!choose_backend(backend_arg, &backend, &error)) {
+        print_error("selecting capture backend", error);
         g_clear_error(&error);
         goto cleanup;
     }
 
-    gchar token[64];
-    g_snprintf(token, sizeof(token), "lamecap_create_%u", ++request_serial);
-    GVariant *results = NULL;
-    if (!portal_request(connection, "CreateSession",
-                        g_variant_new("(@a{sv})", options_with_token(token, FALSE, 0)),
-                        token, &results, &error)) {
-        print_error("creating screen-capture session", error);
-        g_clear_error(&error);
-        goto cleanup;
-    }
-    if (!results || !g_variant_lookup(results, "session_handle", "o", &session_path)) {
-        g_printerr("lamecap: portal did not return a session handle\n");
-        if (results) g_variant_unref(results);
-        goto cleanup;
-    }
-    g_variant_unref(results);
+    if (backend == CAPTURE_BACKEND_X11) {
+        if (!element_factory_exists("ximagesrc")) {
+            g_printerr("lamecap: GStreamer element 'ximagesrc' is missing. Install the GStreamer X11 plugin (often package gstreamer1.0-x).\n");
+            goto cleanup;
+        }
+        if (strcmp(source_mode, "either") != 0) {
+            g_printerr("lamecap: --source applies to the portal backend; use --backend portal to select a monitor or window.\n");
+            exit_status = 2;
+            goto cleanup;
+        }
+    } else {
+        if (!element_factory_exists("pipewiresrc")) {
+            g_printerr("lamecap: GStreamer element 'pipewiresrc' is missing. Install the GStreamer PipeWire plugin.\n");
+            goto cleanup;
+        }
 
-    g_snprintf(token, sizeof(token), "lamecap_select_%u", ++request_serial);
-    if (!portal_request(connection, "SelectSources",
-                        g_variant_new("(o@a{sv})", session_path,
-                                      options_with_token(token, TRUE, source_types)),
-                        token, NULL, &error)) {
-        print_error("selecting capture source", error);
-        g_clear_error(&error);
-        goto cleanup;
+        connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+        if (!connection) {
+            print_error("connecting to the desktop session bus", error);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+
+        gchar token[64];
+        g_snprintf(token, sizeof(token), "lamecap_create_%u", ++request_serial);
+        GVariant *results = NULL;
+        if (!portal_request(connection, "CreateSession",
+                            g_variant_new("(@a{sv})", options_with_token(token, FALSE, 0)),
+                            token, &results, &error)) {
+            print_error("creating screen-capture session", error);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+        if (!results || !g_variant_lookup(results, "session_handle", "o", &session_path)) {
+            g_printerr("lamecap: portal did not return a session handle\n");
+            if (results) g_variant_unref(results);
+            goto cleanup;
+        }
+        g_variant_unref(results);
+
+        g_snprintf(token, sizeof(token), "lamecap_select_%u", ++request_serial);
+        if (!portal_request(connection, "SelectSources",
+                            g_variant_new("(o@a{sv})", session_path,
+                                          options_with_token(token, TRUE, source_types)),
+                            token, NULL, &error)) {
+            print_error("selecting capture source", error);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+
+        g_snprintf(token, sizeof(token), "lamecap_start_%u", ++request_serial);
+        if (!portal_request(connection, "Start",
+                            g_variant_new("(os@a{sv})", session_path, "",
+                                          options_with_token(token, FALSE, 0)),
+                            token, &results, &error)) {
+            print_error("starting screen capture", error);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+
+        GVariant *streams = NULL;
+        guint32 node_id = 0;
+        guint64 serial = 0;
+        if (!results || !g_variant_lookup(results, "streams", "@a(ua{sv})", &streams) ||
+            g_variant_n_children(streams) == 0) {
+            g_printerr("lamecap: portal started, but returned no screen-capture stream\n");
+            if (streams) g_variant_unref(streams);
+            if (results) g_variant_unref(results);
+            goto cleanup;
+        }
+        GVariant *stream_props = NULL;
+        g_variant_get_child(streams, 0, "(u@a{sv})", &node_id, &stream_props);
+        if (!g_variant_lookup(stream_props, "pipewire-serial", "t", &serial))
+            serial = (guint64)node_id;
+        g_variant_unref(stream_props);
+        g_variant_unref(streams);
+        g_variant_unref(results);
+
+        pipewire_fd = open_portal_pipewire_remote(connection, session_path, &error);
+        if (pipewire_fd < 0) {
+            print_error("opening the portal PipeWire connection", error);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+        g_snprintf(serial_text, sizeof(serial_text), "%" G_GUINT64_FORMAT, serial);
+        target_object = serial_text;
     }
 
-    g_snprintf(token, sizeof(token), "lamecap_start_%u", ++request_serial);
-    if (!portal_request(connection, "Start",
-                        g_variant_new("(os@a{sv})", session_path, "",
-                                      options_with_token(token, FALSE, 0)),
-                        token, &results, &error)) {
-        print_error("starting screen capture", error);
-        g_clear_error(&error);
-        goto cleanup;
-    }
-
-    GVariant *streams = NULL;
-    guint32 node_id = 0;
-    guint64 serial = 0;
-    if (!results || !g_variant_lookup(results, "streams", "@a(ua{sv})", &streams) ||
-        g_variant_n_children(streams) == 0) {
-        g_printerr("lamecap: portal started, but returned no screen-capture stream\n");
-        if (streams) g_variant_unref(streams);
-        if (results) g_variant_unref(results);
-        goto cleanup;
-    }
-    GVariant *stream_props = NULL;
-    g_variant_get_child(streams, 0, "(u@a{sv})", &node_id, &stream_props);
-    if (!g_variant_lookup(stream_props, "pipewire-serial", "t", &serial))
-        serial = (guint64)node_id;
-    g_variant_unref(stream_props);
-    g_variant_unref(streams);
-    g_variant_unref(results);
-
-    pipewire_fd = open_portal_pipewire_remote(connection, session_path, &error);
-    if (pipewire_fd < 0) {
-        print_error("opening the portal PipeWire connection", error);
-        g_clear_error(&error);
-        goto cleanup;
-    }
-
-    gchar serial_text[32];
-    g_snprintf(serial_text, sizeof(serial_text), "%" G_GUINT64_FORMAT, serial);
-    pipeline = build_pipeline(pipewire_fd, serial_text, output_arg, audio_monitor, &error);
+    pipeline = build_pipeline(backend, pipewire_fd, target_object,
+                              output_arg, audio_monitor, &error);
     if (!pipeline) {
         print_error("building recording pipeline", error);
         g_clear_error(&error);
